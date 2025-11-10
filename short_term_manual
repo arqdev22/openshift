@@ -1,0 +1,4 @@
+while true; do
+  oc adm top nodes --no-headers >> /var/log/ocp-node-usage.log
+  sleep 86400
+done
