@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+import requests
+import pandas as pd
+import datetime
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# ======== Configuration ========
+THANOS_URL = "https://<thanos-querier-host>"  # Replace with your Thanos or Prometheus route
+BEARER_TOKEN = os.popen("oc whoami -t").read().strip()
+OUTPUT_CSV = "openshift_node_usage_monthly.csv"
+
+# Time range: last 6 months
+end_time = datetime.datetime.utcnow()
+start_time = end_time - datetime.timedelta(days=180)
+step = "1h"
+
+# ======== Queries ========
+QUERIES = {
+    "cpu_usage": "sum(rate(container_cpu_usage_seconds_total{container!='',node!=''}[5m])) by (node)",
+    "mem_usage": "sum(container_memory_usage_bytes{container!='',node!=''}) by (node)"
+}
+
+def query_prometheus(metric_name, promql):
+    url = f"{THANOS_URL}/api/v1/query_range"
+    params = {
+        "query": promql,
+        "start": start_time.isoformat("T") + "Z",
+        "end": end_time.isoformat("T") + "Z",
+        "step": step
+    }
+    headers = {"Authorization": f"Bearer {BEARER_TOKEN}"}
+    r = requests.get(url, headers=headers, params=params, verify=False)
+    r.raise_for_status()
+    results = r.json().get("data", {}).get("result", [])
+    
+    rows = []
+    for res in results:
+        node = res["metric"].get("node", "unknown")
+        for ts, val in res["values"]:
+            try:
+                val = float(val)
+            except ValueError:
+                val = 0
+            timestamp = datetime.datetime.utcfromtimestamp(ts)
+            rows.append({"timestamp": timestamp, "node": node, metric_name: val})
+    return pd.DataFrame(rows)
+
+print("⏳ Fetching CPU usage per node...")
+cpu_df = query_prometheus("cpu_usage", QUERIES["cpu_usage"])
+
+print("⏳ Fetching Memory usage per node...")
+mem_df = query_prometheus("mem_usage", QUERIES["mem_usage"])
+
+print("🔄 Merging CPU and Memory data...")
+df = pd.merge(cpu_df, mem_df, on=["timestamp", "node"], how="outer")
+df.fillna(0, inplace=True)
+df["mem_usage"] = df["mem_usage"] / (1024 * 1024)  # Convert to MiB
+df["month"] = df["timestamp"].dt.to_period("M").astype(str)
+
+print("📊 Aggregating by node and month...")
+summary = (
+    df.groupby(["node", "month"])
+    .agg({
+        "cpu_usage": "mean",
+        "mem_usage": "mean"
+    })
+    .reset_index()
+)
+
+summary.rename(columns={
+    "cpu_usage": "avg_cpu_cores",
+    "mem_usage": "avg_memory_mib"
+}, inplace=True)
+
+summary.sort_values(["node", "month"], inplace=True)
+summary.to_csv(OUTPUT_CSV, index=False)
+
+print(f"✅ Node usage report generated: {OUTPUT_CSV}")
